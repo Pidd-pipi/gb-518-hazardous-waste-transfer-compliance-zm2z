@@ -27,6 +27,7 @@ export interface DomainRecord {
 	quantityKg?: number;
 	destination?: string;
 	manifestCode?: string;
+	manifestVersion?: number;
 	checklist?: string;
 	decisionBasis?: string;
   createdAt: string;

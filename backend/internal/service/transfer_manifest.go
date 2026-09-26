@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/dto"
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/model"
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/repository"
+	"gorm.io/gorm"
 )
 
 type TransferManifestService interface {
@@ -26,10 +28,12 @@ type transferManifestService struct {
 	repository repository.TransferManifestRepository
 	generators repository.WasteGeneratorRepository
 	carriers   repository.CarrierProfileRepository
+	checks     repository.ComplianceCheckRepository
+	security   SecurityService
 }
 
-func NewTransferManifestService(repo repository.TransferManifestRepository, generators repository.WasteGeneratorRepository, carriers repository.CarrierProfileRepository) TransferManifestService {
-	return &transferManifestService{repository: repo, generators: generators, carriers: carriers}
+func NewTransferManifestService(repo repository.TransferManifestRepository, generators repository.WasteGeneratorRepository, carriers repository.CarrierProfileRepository, checks repository.ComplianceCheckRepository, security SecurityService) TransferManifestService {
+	return &transferManifestService{repository: repo, generators: generators, carriers: carriers, checks: checks, security: security}
 }
 
 func (s *transferManifestService) List(ctx context.Context, query dto.PageQuery) (repository.Page[model.TransferManifest], error) {
@@ -119,19 +123,94 @@ func (s *transferManifestService) Transition(ctx context.Context, id uint, input
 	if !constants.CanTransition(constants.TransferManifestTransitions, current.Status, target) {
 		return model.TransferManifest{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, current.Status, target)
 	}
+	if input.ExpectedVersion != current.Version {
+		return model.TransferManifest{}, fmt.Errorf("%w: expected v%d, record is v%d", repository.ErrVersionConflict, input.ExpectedVersion, current.Version)
+	}
 	if target == "submitted" || target == "in_transit" {
 		if err := s.validateLinkedParties(ctx, current); err != nil {
 			return model.TransferManifest{}, err
 		}
 	}
+	authorizingCheck := ""
+	if target == "in_transit" {
+		check, err := s.evaluateShipmentGate(ctx, current, actor, requestID)
+		if err != nil {
+			return model.TransferManifest{}, err
+		}
+		authorizingCheck = fmt.Sprintf("%s v%d", check.Code, check.Version)
+	}
 	before := current.Status
 	current.Status = target
 	current.Version = input.ExpectedVersion + 1
 	current.UpdatedAt = time.Now().UTC()
-	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "TransferManifest", before, target, input.Reason)); err != nil {
+	detail := input.Reason
+	if authorizingCheck != "" {
+		detail = fmt.Sprintf("%s；放行依据：核验 %s 对清单 v%d 的通过决定", strings.TrimSpace(detail), authorizingCheck, current.Version-1)
+	}
+	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "TransferManifest", before, target, detail)); err != nil {
 		return model.TransferManifest{}, fmt.Errorf("transition 转运清单: %w", err)
 	}
 	return s.repository.Get(ctx, id)
+}
+
+// evaluateShipmentGate aligns dispatch with verification: only the latest check
+// recorded against the same manifest code AND the manifest version currently
+// being shipped may release the load, and only when its decision is "pass".
+// Missing records, version drift, pending work, failures and escalations block
+// the shipment; every block is audited under the request ID so operators see
+// which check number held the load and why.
+func (s *transferManifestService) evaluateShipmentGate(ctx context.Context, manifest model.TransferManifest, actor, requestID string) (model.ComplianceCheck, error) {
+	latest, err := s.checks.LatestByManifestCode(ctx, manifest.Code)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return model.ComplianceCheck{}, s.blockShipment(ctx, manifest, actor, requestID, model.ComplianceCheck{},
+				fmt.Sprintf("清单 %s 暂无任何合规核验记录，禁止发运", manifest.Code))
+		}
+		return model.ComplianceCheck{}, fmt.Errorf("query compliance gate: %w", err)
+	}
+	if latest.ManifestVersion != manifest.Version {
+		return model.ComplianceCheck{}, s.blockShipment(ctx, manifest, actor, requestID, latest,
+			fmt.Sprintf("清单 %s 当前为 v%d，但最新核验 %s 绑定的是 v%d，核验版本与清单不一致，禁止发运",
+				manifest.Code, manifest.Version, latest.Code, latest.ManifestVersion))
+	}
+	switch latest.Status {
+	case string(constants.CheckStatePending):
+		return model.ComplianceCheck{}, s.blockShipment(ctx, manifest, actor, requestID, latest,
+			fmt.Sprintf("核验 %s 对清单 %s v%d 仍待处理，等待复核决定期间禁止发运",
+				latest.Code, manifest.Code, manifest.Version))
+	case string(constants.CheckStateFail):
+		return model.ComplianceCheck{}, s.blockShipment(ctx, manifest, actor, requestID, latest,
+			fmt.Sprintf("核验 %s 对清单 %s v%d 的决定为不通过（%s），禁止发运",
+				latest.Code, manifest.Code, manifest.Version, gateReason(latest)))
+	case string(constants.CheckStateEscalated):
+		return model.ComplianceCheck{}, s.blockShipment(ctx, manifest, actor, requestID, latest,
+			fmt.Sprintf("核验 %s 对清单 %s v%d 已升级复核，复核结论形成前禁止发运（%s）",
+				latest.Code, manifest.Code, manifest.Version, gateReason(latest)))
+	case string(constants.CheckStatePass):
+		return latest, nil
+	default:
+		return model.ComplianceCheck{}, s.blockShipment(ctx, manifest, actor, requestID, latest,
+			fmt.Sprintf("核验 %s 状态 %s 不是有效放行决定，禁止发运", latest.Code, latest.Status))
+	}
+}
+
+func gateReason(check model.ComplianceCheck) string {
+	if reason := strings.TrimSpace(check.DecisionBasis); reason != "" {
+		return reason
+	}
+	return "未记录决定依据"
+}
+
+func (s *transferManifestService) blockShipment(ctx context.Context, manifest model.TransferManifest, actor, requestID string, check model.ComplianceCheck, reason string) error {
+	detail := fmt.Sprintf("发运拦截：%s", reason)
+	if check.ID != 0 {
+		detail = fmt.Sprintf("%s（核验编号：%s）", detail, check.Code)
+	}
+	if err := s.security.Audit(ctx, actor, requestID, "shipment_blocked", "TransferManifest", manifest.ID,
+		manifest.Status, manifest.Status, detail); err != nil {
+		return fmt.Errorf("persist shipment block audit: %w", err)
+	}
+	return fmt.Errorf("%w: %s", ErrShipmentBlocked, reason)
 }
 
 func (s *transferManifestService) Delete(ctx context.Context, id uint, actor, requestID string) error {

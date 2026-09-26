@@ -40,6 +40,7 @@ docker compose down -v --remove-orphans
 
 - JWT 登录和 viewer/operator/reviewer/admin 四级 RBAC，后端 middleware、前端守卫、导航与按钮同步生效。
 - 联单提交和发运前会重新核验产废许可为 `active`、承运资质为 `verified`，且双方证照仍在有效期内。
+- 发运（`submitted → in_transit`）强制通过版本化核验闸门：核验建档时快照所绑定的清单版本（`manifestVersion`），发运只接受**同清单编号、同清单版本下最新一次核验**的 `pass` 决定；无核验记录、版本不符、核验仍 `pending`、决定为 `fail` 或已 `escalated` 一律拦截。拦截响应（HTTP 422）直接给出卡住的核验编号和原因；每次拦截写入 `shipment_blocked` 审计，成功放行的联单迁移审计中记录放行依据核验编号，两者均带请求 ID。
 - 联单只允许 `draft → submitted → in_transit → received`，`submitted/in_transit` 可转 `rejected`；核验决定不可回退，失败仅可升级复核。
 - 已提交联单和已决定核验不可编辑或删除；写入使用乐观锁。
 - 建档、许可/证据更新、状态变化和删除与审计日志在同一数据库事务中提交，审计保留 actor 与 request ID。

@@ -12,6 +12,8 @@ import (
 type ComplianceCheckRepository interface {
 	List(context.Context, dto.PageQuery) (Page[model.ComplianceCheck], error)
 	Get(context.Context, uint) (model.ComplianceCheck, error)
+	FindByCode(context.Context, string) (model.ComplianceCheck, error)
+	LatestByManifestCode(context.Context, string) (model.ComplianceCheck, error)
 	Create(context.Context, *model.ComplianceCheck) error
 	CreateAudited(context.Context, *model.ComplianceCheck, *model.AuditLog) error
 	Update(context.Context, uint, uint, *model.ComplianceCheck) error
@@ -34,6 +36,21 @@ func (r *complianceCheckRepository) List(ctx context.Context, q dto.PageQuery) (
 }
 func (r *complianceCheckRepository) Get(ctx context.Context, id uint) (model.ComplianceCheck, error) {
 	return r.store.Get(ctx, id)
+}
+func (r *complianceCheckRepository) FindByCode(ctx context.Context, code string) (model.ComplianceCheck, error) {
+	return r.store.FindByCode(ctx, code)
+}
+
+// LatestByManifestCode returns the most recently decided (or still pending) check
+// recorded against a manifest code regardless of version. The shipment gate uses
+// it to distinguish "no check at all" from "check recorded against another
+// manifest version". Soft-deleted checks are excluded by GORM's default scope.
+func (r *complianceCheckRepository) LatestByManifestCode(ctx context.Context, manifestCode string) (model.ComplianceCheck, error) {
+	var item model.ComplianceCheck
+	err := r.store.db.WithContext(ctx).
+		Where("manifest_code = ?", manifestCode).
+		Order("updated_at DESC, id DESC").First(&item).Error
+	return item, err
 }
 func (r *complianceCheckRepository) Create(ctx context.Context, item *model.ComplianceCheck) error {
 	return r.store.Create(ctx, item)

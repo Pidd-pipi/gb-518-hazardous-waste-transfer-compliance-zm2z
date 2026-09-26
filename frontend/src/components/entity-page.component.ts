@@ -76,7 +76,7 @@ import { StatusBadgeComponent } from './common/status-badge.component';
         <p>确认创建一条包含责任人、业务关联、风险和证据信息的记录。</p>
       </app-confirm-dialog>
       <app-confirm-dialog [open]="!!pending" title="确认状态迁移" (cancel)="closeTransition()" (confirm)="confirmTransition()">
-        <p>状态迁移会校验关联资质，并与请求 ID 审计记录在同一事务中保存。</p>
+        <p>{{ transitionDialogText() }}</p>
         <strong>{{ pending?.item?.status }} → {{ pending?.status }}</strong>
       </app-confirm-dialog>
     </main>
@@ -116,12 +116,19 @@ export class EntityPageComponent implements OnInit {
     if (this.config.key === 'wasteGenerator') return `${item.permitNumber || '-'} · ${item.wasteCategories || '-'}`;
     if (this.config.key === 'carrierProfile') return `${item.licenseNumber || '-'} · ${item.vehicleCount || 0} 辆`;
     if (this.config.key === 'transferManifest') return `${item.generatorCode} → ${item.carrierCode} · ${item.quantityKg} kg`;
-    return `${item.manifestCode || '-'} · ${item.decisionBasis || '待决定'}`;
+    return `${item.manifestCode || '-'} v${item.manifestVersion ?? 0} · ${item.decisionBasis || '待决定'}`;
   }
 
   transitionLabel(status: string): string {
     const labels: Record<string, string> = { submitted: '提交', in_transit: '发运', received: '签收', rejected: '驳回', verified: '核准', restricted: '限制', expired: '到期', active: '恢复', suspended: '停用', pass: '通过', fail: '不通过', escalated: '升级复核' };
     return labels[status] || status;
+  }
+
+  transitionDialogText(): string {
+    if (this.config.key === 'transferManifest' && this.pending?.status === 'in_transit') {
+      return '发运只采用同编号、同清单版本的最新一次核验决定：无记录、版本不符、仍待处理、不通过或升级复核都会拦截；每次拦截与放行均按请求编号留下审计。';
+    }
+    return '状态迁移会校验关联资质，并与请求 ID 审计记录在同一事务中保存。';
   }
 
   async query(): Promise<void> { this.pagination.reset(); await this.load(); }

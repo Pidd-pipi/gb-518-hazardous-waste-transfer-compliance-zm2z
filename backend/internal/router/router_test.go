@@ -140,6 +140,145 @@ func TestRBACLinkedComplianceWorkflowAndAuditing(t *testing.T) {
 	}
 }
 
+func TestShipmentGateRequiresMatchingVersionedPassDecision(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := testConfig(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	db, _, err := database.Open(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	engine := router.New(cfg, db, nil, logger)
+
+	operator := login(t, engine, "operator")
+	reviewer := login(t, engine, "reviewer")
+
+	createSubmittedManifest := func(code string) record {
+		response, body := request(t, engine, http.MethodPost, "/api/manifests", operator, code+"-create", manifestPayload(code, "CP-002"))
+		assertStatus(t, response, http.StatusCreated)
+		manifest := decodeRecord(t, body)
+		response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", manifest.ID), operator, code+"-submit", map[string]any{
+			"status": "submitted", "expectedVersion": manifest.Version, "reason": "linked permits checked",
+		})
+		assertStatus(t, response, http.StatusOK)
+		return decodeRecord(t, body)
+	}
+	createCheck := func(code, manifestCode, requestID string) record {
+		response, body := request(t, engine, http.MethodPost, "/api/checks", operator, requestID, checkPayload(code, manifestCode))
+		assertStatus(t, response, http.StatusCreated)
+		return decodeRecord(t, body)
+	}
+	decide := func(check record, status, requestID string) record {
+		response, body := request(t, engine, http.MethodPost, fmt.Sprintf("/api/checks/%d/transition", check.ID), reviewer, requestID, map[string]any{
+			"status": status, "expectedVersion": check.Version, "reason": "gate test decision " + status,
+		})
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("decide %s %s v%d failed: HTTP %d body=%s", check.Code, status, check.Version, response.StatusCode, string(body))
+		}
+		return decodeRecord(t, body)
+	}
+	ship := func(manifest record, requestID string) (*http.Response, []byte) {
+		return request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", manifest.ID), operator, requestID, map[string]any{
+			"status": "in_transit", "expectedVersion": manifest.Version, "reason": "load ready",
+		})
+	}
+	blockMessage := func(response *http.Response, body []byte, requestID string) string {
+		t.Helper()
+		assertStatus(t, response, http.StatusUnprocessableEntity)
+		var envelope struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Fatalf("decode block response for %s: %v", requestID, err)
+		}
+		return envelope.Message
+	}
+
+	// 1. No compliance check exists for the manifest.
+	manifest := createSubmittedManifest("TM-GATE-NONE")
+	response, body := ship(manifest, "gate-block-no-record")
+	message := blockMessage(response, body, "gate-block-no-record")
+	if !strings.Contains(message, "暂无任何合规核验记录") {
+		t.Fatalf("missing-record block must explain the gap, got %q", message)
+	}
+
+	// 2. Check exists but the reviewer has not decided yet.
+	manifest = createSubmittedManifest("TM-GATE-PENDING")
+	check := createCheck("CC-GATE-PENDING", manifest.Code, "gate-check-pending")
+	response, body = ship(manifest, "gate-block-pending")
+	message = blockMessage(response, body, "gate-block-pending")
+	if !strings.Contains(message, check.Code) || !strings.Contains(message, "仍待处理") {
+		t.Fatalf("pending block must name check %s and pending reason, got %q", check.Code, message)
+	}
+
+	// 3. Reviewer rejected the load.
+	manifest = createSubmittedManifest("TM-GATE-FAIL")
+	check = createCheck("CC-GATE-FAIL", manifest.Code, "gate-check-fail")
+	check = decide(check, "fail", "gate-decide-fail")
+	response, body = ship(manifest, "gate-block-fail")
+	message = blockMessage(response, body, "gate-block-fail")
+	if !strings.Contains(message, check.Code) || !strings.Contains(message, "不通过") {
+		t.Fatalf("fail block must name check %s and fail reason, got %q", check.Code, message)
+	}
+
+	// 4. The rejected check was escalated; escalation is still not a release.
+	check = decide(check, "escalated", "gate-decide-escalated")
+	response, body = ship(manifest, "gate-block-escalated")
+	message = blockMessage(response, body, "gate-block-escalated")
+	if !strings.Contains(message, check.Code) || !strings.Contains(message, "升级复核") {
+		t.Fatalf("escalated block must name check %s and escalation reason, got %q", check.Code, message)
+	}
+
+	// 5. Check passed against an older manifest version; the load changed meanwhile.
+	response, body = request(t, engine, http.MethodPost, "/api/manifests", operator, "gate-stale-create", manifestPayload("TM-GATE-STALE", "CP-002"))
+	assertStatus(t, response, http.StatusCreated)
+	staleManifest := decodeRecord(t, body)
+	staleCheck := createCheck("CC-GATE-STALE", staleManifest.Code, "gate-check-stale-v1")
+	response, _ = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", staleManifest.ID), operator, "gate-stale-submit", map[string]any{
+		"status": "submitted", "expectedVersion": staleManifest.Version, "reason": "now submitted at v2",
+	})
+	assertStatus(t, response, http.StatusOK)
+	staleCheck = decide(staleCheck, "pass", "gate-decide-stale-pass")
+	response, body = request(t, engine, http.MethodGet, fmt.Sprintf("/api/checks/%d", staleCheck.ID), reviewer, "", nil)
+	assertStatus(t, response, http.StatusOK)
+	var checkEnvelope struct {
+		Data struct {
+			ManifestVersion uint `json:"manifestVersion"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &checkEnvelope); err != nil || checkEnvelope.Data.ManifestVersion != 1 {
+		t.Fatalf("check must snapshot manifest v1, got %+v err=%v", checkEnvelope.Data, err)
+	}
+	response, body = request(t, engine, http.MethodPost, fmt.Sprintf("/api/manifests/%d/transition", staleManifest.ID), operator, "gate-block-version", map[string]any{
+		"status": "in_transit", "expectedVersion": staleManifest.Version + 1, "reason": "stale decision must not release",
+	})
+	message = blockMessage(response, body, "gate-block-version")
+	if !strings.Contains(message, staleCheck.Code) || !strings.Contains(message, "v1") || !strings.Contains(message, "v2") {
+		t.Fatalf("version block must name check %s and both versions, got %q", staleCheck.Code, message)
+	}
+
+	// 6. Matching code + version with a pass decision releases the load.
+	manifest = createSubmittedManifest("TM-GATE-PASS")
+	check = createCheck("CC-GATE-PASS", manifest.Code, "gate-check-pass")
+	decide(check, "pass", "gate-decide-pass")
+	response, body = ship(manifest, "gate-release-pass")
+	assertStatus(t, response, http.StatusOK)
+	shipped := decodeRecord(t, body)
+	if shipped.Status != "in_transit" || shipped.Version != 3 {
+		t.Fatalf("matching pass should release shipment, got %+v", shipped)
+	}
+
+	// 7. Every block and the successful release are audited under their request IDs.
+	response, body = request(t, engine, http.MethodGet, "/api/audits?page=1&pageSize=100", reviewer, "gate-audit-read", nil)
+	assertStatus(t, response, http.StatusOK)
+	for _, expected := range []string{"gate-block-no-record", "gate-block-pending", "gate-block-fail", "gate-block-escalated", "gate-block-version", "gate-release-pass", "shipment_blocked", "CC-GATE-PASS"} {
+		if !bytes.Contains(body, []byte(expected)) {
+			t.Fatalf("audit trail must contain %q", expected)
+		}
+	}
+}
+
 func testConfig(t *testing.T) config.Config {
 	t.Helper()
 	return config.Config{
