@@ -35,7 +35,7 @@ func New(cfg config.Config, db *gorm.DB, redisClient *redis.Client, logger *slog
 	complianceCheckRepository := repository.NewComplianceCheckRepository(db)
 	wasteGeneratorService := service.NewWasteGeneratorService(wasteGeneratorRepository, securityService)
 	carrierProfileService := service.NewCarrierProfileService(carrierProfileRepository, securityService)
-	transferManifestService := service.NewTransferManifestService(transferManifestRepository, wasteGeneratorRepository, carrierProfileRepository)
+	transferManifestService := service.NewTransferManifestService(transferManifestRepository, wasteGeneratorRepository, carrierProfileRepository, complianceCheckRepository, securityService)
 	complianceCheckService := service.NewComplianceCheckService(complianceCheckRepository, transferManifestRepository)
 	wasteGeneratorHandler := handler.NewWasteGeneratorHandler(wasteGeneratorService)
 	carrierProfileHandler := handler.NewCarrierProfileHandler(carrierProfileService)

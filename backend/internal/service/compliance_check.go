@@ -43,7 +43,8 @@ func (s *complianceCheckService) Create(ctx context.Context, input dto.CreateCom
 	if err := validateComplianceCheckBusinessFields(input.Code, input.Name, input.Facility, input.Owner, input.ManifestCode, input.Checklist, input.Evidence); err != nil {
 		return model.ComplianceCheck{}, err
 	}
-	if _, err := s.manifests.FindByCode(ctx, input.ManifestCode); err != nil {
+	manifest, err := s.manifests.FindByCode(ctx, input.ManifestCode)
+	if err != nil {
 		return model.ComplianceCheck{}, fmt.Errorf("%w: manifest %s does not exist", ErrInvalidInput, input.ManifestCode)
 	}
 	item := model.ComplianceCheck{
@@ -51,7 +52,7 @@ func (s *complianceCheckService) Create(ctx context.Context, input dto.CreateCom
 			Code: strings.ToUpper(strings.TrimSpace(input.Code)), Name: strings.TrimSpace(input.Name),
 			Status: model.ComplianceCheckInitialStatus, Version: 1, Description: strings.TrimSpace(input.Description),
 		},
-		ManifestCode: strings.ToUpper(strings.TrimSpace(input.ManifestCode)), Checklist: strings.TrimSpace(input.Checklist), DecisionBasis: strings.TrimSpace(input.DecisionBasis),
+		ManifestCode: strings.ToUpper(strings.TrimSpace(input.ManifestCode)), ManifestVersion: manifest.Version, Checklist: strings.TrimSpace(input.Checklist), DecisionBasis: strings.TrimSpace(input.DecisionBasis),
 		Facility: strings.TrimSpace(input.Facility), Owner: strings.TrimSpace(input.Owner),
 		Category: strings.TrimSpace(input.Category), RiskLevel: input.RiskLevel,
 		MetricValue: input.MetricValue, MetricUnit: strings.TrimSpace(input.MetricUnit),
@@ -75,11 +76,13 @@ func (s *complianceCheckService) Update(ctx context.Context, id uint, input dto.
 	if err := validateComplianceCheckBusinessFields(current.Code, input.Name, input.Facility, input.Owner, input.ManifestCode, input.Checklist, input.Evidence); err != nil {
 		return model.ComplianceCheck{}, err
 	}
-	if _, err := s.manifests.FindByCode(ctx, input.ManifestCode); err != nil {
+	manifest, err := s.manifests.FindByCode(ctx, input.ManifestCode)
+	if err != nil {
 		return model.ComplianceCheck{}, fmt.Errorf("%w: manifest %s does not exist", ErrInvalidInput, input.ManifestCode)
 	}
 	current.Name = strings.TrimSpace(input.Name)
 	current.ManifestCode = strings.ToUpper(strings.TrimSpace(input.ManifestCode))
+	current.ManifestVersion = manifest.Version
 	current.Checklist = strings.TrimSpace(input.Checklist)
 	current.DecisionBasis = strings.TrimSpace(input.DecisionBasis)
 	current.Description = strings.TrimSpace(input.Description)
@@ -124,6 +127,9 @@ func (s *complianceCheckService) Transition(ctx context.Context, id uint, input 
 	current.Version = input.ExpectedVersion + 1
 	current.UpdatedAt = time.Now().UTC()
 	current.DecisionBasis = strings.TrimSpace(input.Reason)
+	// Pin the decision to the manifest revision verified right now; the
+	// shipment gate only accepts a decision matching the current version.
+	current.ManifestVersion = manifest.Version
 	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "ComplianceCheck", before, target, input.Reason)); err != nil {
 		return model.ComplianceCheck{}, fmt.Errorf("transition 合规核验: %w", err)
 	}

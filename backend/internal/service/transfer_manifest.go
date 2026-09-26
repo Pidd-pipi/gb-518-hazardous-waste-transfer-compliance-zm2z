@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/dto"
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/model"
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/repository"
+	"gorm.io/gorm"
 )
 
 type TransferManifestService interface {
@@ -26,10 +28,12 @@ type transferManifestService struct {
 	repository repository.TransferManifestRepository
 	generators repository.WasteGeneratorRepository
 	carriers   repository.CarrierProfileRepository
+	checks     repository.ComplianceCheckRepository
+	security   SecurityService
 }
 
-func NewTransferManifestService(repo repository.TransferManifestRepository, generators repository.WasteGeneratorRepository, carriers repository.CarrierProfileRepository) TransferManifestService {
-	return &transferManifestService{repository: repo, generators: generators, carriers: carriers}
+func NewTransferManifestService(repo repository.TransferManifestRepository, generators repository.WasteGeneratorRepository, carriers repository.CarrierProfileRepository, checks repository.ComplianceCheckRepository, security SecurityService) TransferManifestService {
+	return &transferManifestService{repository: repo, generators: generators, carriers: carriers, checks: checks, security: security}
 }
 
 func (s *transferManifestService) List(ctx context.Context, query dto.PageQuery) (repository.Page[model.TransferManifest], error) {
@@ -119,16 +123,29 @@ func (s *transferManifestService) Transition(ctx context.Context, id uint, input
 	if !constants.CanTransition(constants.TransferManifestTransitions, current.Status, target) {
 		return model.TransferManifest{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, current.Status, target)
 	}
+	// Stale clients conflict before any business rule runs, so a retried
+	// shipment always sees 409 instead of a gate evaluation on old data.
+	if input.ExpectedVersion != current.Version {
+		return model.TransferManifest{}, repository.ErrVersionConflict
+	}
 	if target == "submitted" || target == "in_transit" {
 		if err := s.validateLinkedParties(ctx, current); err != nil {
 			return model.TransferManifest{}, err
 		}
 	}
+	detail := strings.TrimSpace(input.Reason)
+	if target == string(constants.ManifestStateInTransit) {
+		check, err := s.enforceShipmentGate(ctx, current, actor, requestID)
+		if err != nil {
+			return model.TransferManifest{}, err
+		}
+		detail = fmt.Sprintf("%s；发运放行：采用核验 %s 对清单版本 %d 的通过决定", detail, check.Code, check.ManifestVersion)
+	}
 	before := current.Status
 	current.Status = target
 	current.Version = input.ExpectedVersion + 1
 	current.UpdatedAt = time.Now().UTC()
-	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "TransferManifest", before, target, input.Reason)); err != nil {
+	if err := s.repository.UpdateAudited(ctx, id, input.ExpectedVersion, &current, newAuditLog(actor, requestID, "transition", "TransferManifest", before, target, detail)); err != nil {
 		return model.TransferManifest{}, fmt.Errorf("transition 转运清单: %w", err)
 	}
 	return s.repository.Get(ctx, id)
@@ -165,6 +182,52 @@ func (s *transferManifestService) validateLinkedParties(ctx context.Context, man
 		return fmt.Errorf("%w: carrier license must be verified and unexpired", ErrInvalidInput)
 	}
 	return nil
+}
+
+// enforceShipmentGate aligns shipment with the compliance decision: only the
+// newest check registered for the manifest code counts, and it must be a pass
+// recorded against the manifest version being shipped. Every interception is
+// audited with the request ID before the operator is told why.
+func (s *transferManifestService) enforceShipmentGate(ctx context.Context, manifest model.TransferManifest, actor, requestID string) (model.ComplianceCheck, error) {
+	latest, err := s.checks.FindLatestByManifestCode(ctx, manifest.Code)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.ComplianceCheck{}, s.interceptShipment(ctx, manifest, actor, requestID,
+			fmt.Sprintf("清单 %s 没有核验记录，请先完成合规核验", manifest.Code))
+	}
+	if err != nil {
+		return model.ComplianceCheck{}, fmt.Errorf("load latest compliance check: %w", err)
+	}
+	switch {
+	case latest.ManifestVersion != manifest.Version:
+		return model.ComplianceCheck{}, s.interceptShipment(ctx, manifest, actor, requestID,
+			fmt.Sprintf("核验 %s 针对清单版本 %d，与当前清单版本 %d 不符，请重新核验", latest.Code, latest.ManifestVersion, manifest.Version))
+	case latest.Status == string(constants.CheckStatePending):
+		return model.ComplianceCheck{}, s.interceptShipment(ctx, manifest, actor, requestID,
+			fmt.Sprintf("核验 %s 仍待处理，等待复核决定", latest.Code))
+	case latest.Status == string(constants.CheckStateFail):
+		reason := fmt.Sprintf("核验 %s 决定不通过", latest.Code)
+		if basis := strings.TrimSpace(latest.DecisionBasis); basis != "" {
+			reason = fmt.Sprintf("%s：%s", reason, basis)
+		}
+		return model.ComplianceCheck{}, s.interceptShipment(ctx, manifest, actor, requestID, reason)
+	case latest.Status == string(constants.CheckStateEscalated):
+		return model.ComplianceCheck{}, s.interceptShipment(ctx, manifest, actor, requestID,
+			fmt.Sprintf("核验 %s 已升级复核，等待复核结论", latest.Code))
+	case latest.Status != string(constants.CheckStatePass):
+		return model.ComplianceCheck{}, s.interceptShipment(ctx, manifest, actor, requestID,
+			fmt.Sprintf("核验 %s 状态 %s 不允许发运", latest.Code, latest.Status))
+	}
+	return latest, nil
+}
+
+// interceptShipment records the blocked attempt under the request ID, then
+// returns the operator-facing error carrying the check code and reason.
+func (s *transferManifestService) interceptShipment(ctx context.Context, manifest model.TransferManifest, actor, requestID, reason string) error {
+	detail := fmt.Sprintf("发运拦截：%s", reason)
+	if err := s.security.Audit(ctx, actor, requestID, "shipment_blocked", "TransferManifest", manifest.ID, manifest.Status, manifest.Status, detail); err != nil {
+		return fmt.Errorf("record shipment interception: %w", err)
+	}
+	return fmt.Errorf("%w: %s", ErrShipmentBlocked, reason)
 }
 
 func validateTransferManifestBusinessFields(code, name, facility, owner, generatorCode, carrierCode, wasteCode, destination, evidence string, quantityKg float64) error {

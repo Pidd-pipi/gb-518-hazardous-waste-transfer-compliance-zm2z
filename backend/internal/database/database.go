@@ -220,19 +220,19 @@ func seedComplianceCheck(ctx context.Context, db *gorm.DB) error {
 	items := []model.ComplianceCheck{
 
 		{BaseModel: model.BaseModel{Code: "CC-001", Name: "合规核验示例一", Status: "pending", Version: 1,
-			Description: "用于启动验证和主要流程演示的合规核验记录"}, ManifestCode: "TM-002", Checklist: "产废许可、承运资质、联单数量、处置去向", DecisionBasis: "",
+			Description: "用于启动验证和主要流程演示的合规核验记录"}, ManifestCode: "TM-002", ManifestVersion: 1, Checklist: "产废许可、承运资质、联单数量、处置去向", DecisionBasis: "",
 			Facility: "危险废物转运合规核验区域1", Owner: "运行一组",
 			Category: "常规", RiskLevel: "low", MetricValue: 12.5, MetricUnit: "unit",
 			EffectiveAt: now.Add(0 * time.Hour), Evidence: "已完成基础证据核对", RelatedCode: "REL-518-01"},
 
 		{BaseModel: model.BaseModel{Code: "CC-002", Name: "合规核验示例二", Status: "pass", Version: 1,
-			Description: "用于启动验证和主要流程演示的合规核验记录"}, ManifestCode: "TM-002", Checklist: "产废许可、承运资质、联单数量、处置去向", DecisionBasis: "证据齐全且资质有效",
+			Description: "用于启动验证和主要流程演示的合规核验记录"}, ManifestCode: "TM-002", ManifestVersion: 1, Checklist: "产废许可、承运资质、联单数量、处置去向", DecisionBasis: "证据齐全且资质有效",
 			Facility: "危险废物转运合规核验区域2", Owner: "质量复核组",
 			Category: "重点", RiskLevel: "medium", MetricValue: 25.0, MetricUnit: "%",
 			EffectiveAt: now.Add(3 * time.Hour), Evidence: "已完成基础证据核对", RelatedCode: "REL-518-02"},
 
 		{BaseModel: model.BaseModel{Code: "CC-003", Name: "合规核验示例三", Status: "fail", Version: 1,
-			Description: "用于启动验证和主要流程演示的合规核验记录"}, ManifestCode: "TM-003", Checklist: "产废许可、承运资质、联单数量、处置去向", DecisionBasis: "重量凭证存在差异",
+			Description: "用于启动验证和主要流程演示的合规核验记录"}, ManifestCode: "TM-003", ManifestVersion: 1, Checklist: "产废许可、承运资质、联单数量、处置去向", DecisionBasis: "重量凭证存在差异",
 			Facility: "危险废物转运合规核验区域3", Owner: "安全主管组",
 			Category: "复核", RiskLevel: "high", MetricValue: 37.5, MetricUnit: "score",
 			EffectiveAt: now.Add(6 * time.Hour), Evidence: "已完成基础证据核对", RelatedCode: "REL-518-03"},

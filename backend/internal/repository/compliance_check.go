@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"strings"
 
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/dto"
 	"github.com/blueship581/hazardous-waste-transfer-compliance/backend/internal/model"
@@ -12,6 +13,7 @@ import (
 type ComplianceCheckRepository interface {
 	List(context.Context, dto.PageQuery) (Page[model.ComplianceCheck], error)
 	Get(context.Context, uint) (model.ComplianceCheck, error)
+	FindLatestByManifestCode(context.Context, string) (model.ComplianceCheck, error)
 	Create(context.Context, *model.ComplianceCheck) error
 	CreateAudited(context.Context, *model.ComplianceCheck, *model.AuditLog) error
 	Update(context.Context, uint, uint, *model.ComplianceCheck) error
@@ -23,10 +25,11 @@ type ComplianceCheckRepository interface {
 
 type complianceCheckRepository struct {
 	store *Store[model.ComplianceCheck]
+	db    *gorm.DB
 }
 
 func NewComplianceCheckRepository(db *gorm.DB) ComplianceCheckRepository {
-	return &complianceCheckRepository{store: NewStore[model.ComplianceCheck](db)}
+	return &complianceCheckRepository{store: NewStore[model.ComplianceCheck](db), db: db}
 }
 
 func (r *complianceCheckRepository) List(ctx context.Context, q dto.PageQuery) (Page[model.ComplianceCheck], error) {
@@ -34,6 +37,16 @@ func (r *complianceCheckRepository) List(ctx context.Context, q dto.PageQuery) (
 }
 func (r *complianceCheckRepository) Get(ctx context.Context, id uint) (model.ComplianceCheck, error) {
 	return r.store.Get(ctx, id)
+}
+
+// FindLatestByManifestCode returns the most recently registered check for a
+// manifest code. The shipment gate only trusts this newest decision.
+func (r *complianceCheckRepository) FindLatestByManifestCode(ctx context.Context, manifestCode string) (model.ComplianceCheck, error) {
+	var item model.ComplianceCheck
+	err := r.db.WithContext(ctx).
+		Where("UPPER(manifest_code) = ?", strings.ToUpper(strings.TrimSpace(manifestCode))).
+		Order("id DESC").First(&item).Error
+	return item, err
 }
 func (r *complianceCheckRepository) Create(ctx context.Context, item *model.ComplianceCheck) error {
 	return r.store.Create(ctx, item)
